@@ -1,0 +1,56 @@
+# ARIA Python Dependencies
+# Install with: pip install -r requirements.txt
+#
+# NOTE: openwakeword is NOT listed here — install it manually:
+#   pip install onnxruntime
+#   pip install openwakeword --no-deps
+#   pip install requests tqdm
+# This avoids the tflite-runtime Python 3.13 incompatibility on Pi 5.
+
+# Speech-to-text
+openai-whisper>=20231117
+
+# Wake word ONNX backend (replaces tflite-runtime)
+onnxruntime>=1.17.0
+
+# LLM
+ollama>=0.2.0
+
+# Audio
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Skills
+requests>=2.31.0
+duckduckgo-search>=6.0.0
+feedparser>=6.0.10
+psutil>=5.9.0
+
+# Spotify
+spotipy>=2.23.0
+
+# Optionally for GPIO LEDs (Pi only)
+# gpiozero>=2.0
+
+# ── BMO Extended Features ───────────────────────────────────────────────────
+
+# Groq API (sub-1s cloud LLM)
+groq>=0.9.0
+
+# Instagram posting
+# pip install instagrapi pillow
+instagrapi>=2.0.0
+Pillow>=10.0.0
+
+# TV Control — Wake-on-LAN (optional, used alongside CEC/Roku/SmartThings)
+# pip install wakeonlan
+# wakeonlan>=3.0.0
+
+# Meme fetching — already covered by requests (no extra dep)
+
+# Web App / API
+Flask>=3.0.0
+
+# Speaker recognition (voice ID) — reuses the torch install already pulled
+# in by openai-whisper, so this is a light add on top.
+resemblyzer>=0.1.1
