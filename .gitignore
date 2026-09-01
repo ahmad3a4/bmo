@@ -1,0 +1,38 @@
+# Secrets & personal data — never commit
+config.json
+data/
+.cache
+
+# Virtual environments
+myenv/
+venv/
+
+# Large binary assets — not source, don't belong in git history
+voices/*.onnx
+voices/*.onnx.json
+piper/
+piper_linux_x86_64.tar.gz
+bmo_training_clips.tar.gz
+instagram_qr.png
+
+# Leftover local test/output junk
+aria_out.*
+test.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Claude Code local settings — machine-specific, not for the repo
+.claude/
+
+# Nested/unrelated git repo (has its own .git, out of scope for this repo)
+Instagram_Playwright_Automation/
+
+# Stray node_modules with no actual source code
+bmo_face_web/

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#54bfa3">
+    <title>BMO Controller</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <link rel="manifest" href="manifest.json">
+</head>
+<body>
+    <div class="bmo-container">
+        <!-- BMO Header / Screen -->
+        <div class="bmo-screen-bezel">
+            <div class="bmo-screen glass-panel">
+                <div class="status-indicator">
+                    <div id="status-dot" class="dot"></div>
+                    <span id="status-text">INITIALIZING...</span>
+                </div>
+                
+                <div class="face-container">
+                    <div class="eye left"></div>
+                    <div class="mouth"></div>
+                    <div class="eye right"></div>
+                </div>
+                
+                <div class="spotify-status">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>
+                    <span id="spotify-text">Music Paused</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Controls Section -->
+        <div class="bmo-body">
+            
+            <div class="input-section glass-panel">
+                <label for="command-input">SEND COMMAND</label>
+                <div class="input-group">
+                    <input type="text" id="command-input" placeholder="e.g., What time is it?" autocomplete="off">
+                    <button id="send-cmd-btn" class="bmo-btn primary-btn">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                    </button>
+                </div>
+            </div>
+            
+            <div class="input-section glass-panel">
+                <label for="speak-input">MAKE BMO SPEAK</label>
+                <div class="input-group">
+                    <input type="text" id="speak-input" placeholder="Type words for BMO..." autocomplete="off">
+                    <button id="speak-btn" class="bmo-btn action-btn">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>
+                    </button>
+                </div>
+            </div>
+
+            <div class="quick-actions">
+                <button class="bmo-btn d-pad-btn" onclick="sendCommand('wake pc')">
+                    WAKE PC
+                </button>
+                <button class="bmo-btn d-pad-btn" onclick="sendCommand('turn off screen')">
+                    TV OFF
+                </button>
+                <button class="bmo-btn d-pad-btn" onclick="sendCommand('play spotify')">
+                    PLAY/PAUSE
+                </button>
+                <button class="bmo-btn d-pad-btn" onclick="sendCommand('list alarms')">
+                    ALARMS
+                </button>
+            </div>
+            
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
