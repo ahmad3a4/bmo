@@ -31,6 +31,17 @@ ALARMS_FILE          = os.path.join(DATA_DIR, "alarms.json")
 REMINDERS_FILE       = os.path.join(DATA_DIR, "reminders.json")
 SEMANTIC_MEMORY_FILE = os.path.join(DATA_DIR, "semantic_memory.json")
 VOICEPRINTS_FILE     = os.path.join(DATA_DIR, "voiceprints.json")
+LIFE_STATE_FILE      = os.path.join(DATA_DIR, "life_state.json")
+SELFIES_DIR          = os.path.join(DATA_DIR, "selfies")
+CACHE_DIR            = os.path.join(DATA_DIR, "cache")
+DIARY_FILE           = os.path.join(DATA_DIR, "bmo_diary.json")
+
+# Face ID (bmo/face_id.py) — distinct from FACES_DIR above, which holds the
+# TFT emotion-display assets, not biometric data.
+KNOWN_FACES_DIR    = os.path.join(DATA_DIR, "known_faces")
+# Lives outside data/ (which is gitignored wholesale) since this is a public,
+# non-personal static asset that should ship with the repo, not be regenerated.
+FACE_CASCADE_PATH  = os.path.join(PROJECT_ROOT, "assets", "haarcascade_frontalface_default.xml")
 
 # Instagram data/ files (bmo/instagram/scheduler.py + web.py)
 IG_SESSION_FILE = os.path.join(DATA_DIR, "ig_session.json")

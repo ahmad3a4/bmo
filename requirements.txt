@@ -19,6 +19,13 @@ ollama>=0.2.0
 # Audio
 sounddevice>=0.4.6
 numpy>=1.24.0
+scipy>=1.10.0
+
+# Text-to-speech (run in-process so BMO knows exactly when a line ends)
+piper-tts>=1.4.0
+
+# Speech endpointing (when you start / stop talking)
+webrtcvad>=2.0.10
 
 # Skills
 requests>=2.31.0
@@ -54,3 +61,7 @@ Flask>=3.0.0
 # Speaker recognition (voice ID) — reuses the torch install already pulled
 # in by openai-whisper, so this is a light add on top.
 resemblyzer>=0.1.1
+
+# Face recognition (face ID) — headless + contrib for cv2.face's LBPH
+# recognizer; prebuilt aarch64 wheel, no dlib/face_recognition compile needed.
+opencv-contrib-python-headless>=4.10.0

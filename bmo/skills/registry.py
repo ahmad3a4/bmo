@@ -258,6 +258,35 @@ def _b_notes(router, low, text):
     return None
 
 
+def _b_vision(router, low, text):
+    # ── Vision (camera) ───────────────────────────────────────────────────
+    if re.search(r"\bselfie\b", low):
+        return {"action": "take_selfie"}
+    if re.search(r"\broast me\b|\broast my (?:fit|outfit|look)\b|"
+                 r"\b(?:rate|judge) my (?:fit|outfit|look)\b", low):
+        return {"action": "vision_roast"}
+    if re.search(r"\bread (?:this|that|it)\b|\bwhat does (?:this|that|it) say\b", low):
+        return {"action": "vision_describe",
+                "question": "Read any text visible in the image aloud, as accurately as you can."}
+    # "what I look like" / "what do I look like" / "what does he look like" —
+    # STT sometimes drops the "do", so match loosely on the core phrase.
+    if re.search(r"\bwhat (?:do |does )?(?:i|he|she|they) look like\b", low):
+        return {"action": "vision_describe",
+                "question": "Describe what the person in frame looks like — their appearance, clothing, expression."}
+    if re.search(r"\b(?:can|do) you see me\b|\bare you (?:looking at|seeing) me\b", low):
+        return {"action": "vision_describe",
+                "question": "Describe what you see, especially the person in frame."}
+    if re.search(r"\bwhat (?:do|can) you see\b|\bwhat'?s in front of you\b|"
+                 r"\blook at this\b|\btake a look\b|\btake a (?:photo|picture)\b|"
+                 r"\bcan you see\b|\bdo you see\b|\buse your eyes?\b", low):
+        return {"action": "vision_describe", "question": "Describe what you see."}
+    # Anything that mentions "your camera" alongside a look/see/tell-me verb —
+    # covers odd phrasings like "look through your camera and tell me what this is".
+    if re.search(r"\byour camera\b", low) and re.search(r"\blook|\bsee\b|\btell me\b|\bwhat\b|\bshow\b|\bcheck\b", low):
+        return {"action": "vision_describe", "question": "Describe what you see."}
+    return None
+
+
 def _b_bored(router, low, text):
     # ── Bored Activity ───────────────────────────────────────────────────
     if re.search(r"\b(?:i.?m bored|what (?:should|can) i do|give me (?:something|an activity)|suggest (?:something|an activity)|bored)", low):
@@ -310,6 +339,7 @@ INTENT_REGISTRY = [
     ("timers",                _b_timers),
     ("instagram",             _b_instagram),
     ("notes",                 _b_notes),
+    ("vision",                _b_vision),
     ("bored",                 _b_bored),
     ("fun_web",               _b_fun_web),
     ("games_second",          _b_games_second),

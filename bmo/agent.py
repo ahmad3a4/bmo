@@ -19,12 +19,15 @@ except ImportError:
     HAS_OWW = False
     print("[OWW] openwakeword not installed — PTT mode only (press Enter).", flush=True)
 
-from bmo.brain  import STT, OllamaAI, BMOBrain, ARIAVoice, GroqVoice
+from bmo.brain  import STT, OllamaAI, BMOBrain, ARIAVoice, GroqVoice, is_whisper_phantom
 from bmo.skills import SkillsRouter
 from bmo.alarms import AlarmManager
 from bmo.journal import JournalManager, CHECKIN_QUESTIONS
 from bmo.semantic_memory import SemanticMemory
 from bmo.voiceprint import VoiceIDManager
+from bmo.face_id import FaceIDManager
+from bmo.life import LifeEngine
+from bmo.vad import Endpointer
 from bmo.config import load_config
 from bmo.paths import PROJECT_ROOT, VOICES_DIR, WAKEWORD_DIR, FACES_DIR
 
@@ -242,6 +245,17 @@ class ARIAAgent:
             threshold=CFG.get("voice_id_threshold", 0.75),
         )
 
+        # ── Face recognition ────────────────────────────────────────────────
+        self.faceid = FaceIDManager(
+            enabled=CFG.get("face_id_enabled", True),
+            threshold=CFG.get("face_id_threshold", 70.0),
+        )
+
+        # One-shot: after BMO asks something on its own, listen once without the wake word.
+        self._listen_for_reply = False
+        # From _record(): "strong" / "weak" / "none" per the VAD, None if it isn't available.
+        self._last_rec_evidence = None
+
         # ── Nightly check-in / mood journal ────────────────────────────────
         self._checkin_pending  = False
         self._checkin_deadline = 0.0
@@ -249,6 +263,15 @@ class ARIAAgent:
             on_fire=self._checkin_fire,
             checkin_time=CFG.get("checkin_time", "21:30"),
             enabled=CFG.get("checkin_enabled", True),
+        )
+
+        # ── Inner life (moods, acting on its own, diary) ───────────────────
+        self.life = LifeEngine(
+            CFG,
+            say=self._life_say,
+            can_speak=self._life_can_speak,
+            look=self.faceid.look,
+            set_face=self._life_face,
         )
 
         # ── Semantic memory (free-form conversational recall) ──────────────
@@ -294,6 +317,7 @@ class ARIAAgent:
                 robotic_fx=CFG.get("robotic_fx", True),
                 voices_dir=VOICES_DIR,
             )
+            self.skills.selfie.set_voice(self.voice)
         # ── BMO faces (code-drawn fallback, set in GUI) ───────────────────────
         self._bmo_faces = BMOFaces(
             canvas=None,
@@ -525,6 +549,9 @@ class ARIAAgent:
                 elif s == S.IDLE and getattr(self, "_spotify_playing", False):
                     # BMO is playing Spotify music in IDLE state — go DJ Mode!
                     emotion = "music"
+                elif s == S.IDLE and cur_em in ("sleep", "sad"):
+                    # Mood face from BMO's inner life (sleepy at night, lonely when ignored)
+                    emotion = cur_em
                 else:
                     emotion = self._bmo_faces.emotion_for_state(s)
 
@@ -570,12 +597,20 @@ class ARIAAgent:
             self.recording.set()
             self.ptt_ev.set()
 
-    def _do_interrupt(self, _=None):
-        self.interrupted.set()
+    def _stop_speaking(self):
         with self._tts_lock:
             self._tts_q.clear()
         self.stop_tts.set()
         self.voice.stop()
+
+    def _tts_idle(self):
+        # Queue first, then busy: the worker sets busy before it pops, so this
+        # order can never see "empty queue, not busy" while a line is starting.
+        return not self._tts_q and not self._tts_busy.is_set()
+
+    def _do_interrupt(self, _=None):
+        self.interrupted.set()
+        self._stop_speaking()
         if HAS_MEDIA and getattr(self.skills, "media", None):
             self.skills.media.clear()
         self._set_state(S.IDLE, "Interrupted.")
@@ -602,13 +637,53 @@ class ARIAAgent:
     def _checkin_fire(self):
         """Called by JournalManager once/day. Only asks if BMO is idle —
         returns False (meaning: try again in 30s) otherwise."""
-        if self.state != S.IDLE or self._tts_busy.is_set() or self._tts_q:
+        if self.state != S.IDLE or not self._tts_idle() or self._listen_for_reply:
             return False
         import random
         self.enqueue(random.choice(CHECKIN_QUESTIONS))
         self._checkin_pending  = True
         self._checkin_deadline = time.time() + 240  # 4 min to reply
+        self._listen_for_reply = True
         return True
+
+    def _no_speech(self, src):
+        """Nobody actually spoke: a false wake, or no answer to something BMO asked."""
+        if src == "REPLY":
+            if self._checkin_pending:
+                self._checkin_pending = False
+            else:
+                self.life.on_no_reply()
+        print("[REC] No speech heard — back to idle.", flush=True)
+        self._set_state(S.IDLE, "No speech detected.")
+
+    # ─── Inner life callbacks ────────────────────────────────────────────────
+    def _life_can_speak(self):
+        if self.state != S.IDLE or not self._tts_idle() or self.recording.is_set():
+            return False
+        if self._listen_for_reply or self._checkin_pending:
+            return False
+        if self._spotify_playing or (self._ambient and self._ambient.is_active()):
+            return False
+        media = getattr(self.skills, "media", None)
+        if media and media.is_active():  # selfie preview, a photo or meme on screen
+            return False
+        games = getattr(self.skills, "games", None)
+        return not (games and games.running)
+
+    def _life_say(self, text, expect_reply=False):
+        if not self._life_can_speak():
+            return False
+        self.ai.note_spoken(text)
+        for s in [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]:
+            self.enqueue(s)
+        if expect_reply:
+            self._listen_for_reply = True
+        return True
+
+    def _life_face(self, emotion):
+        f = self._bmo_faces
+        if f and f._emotion in ("idle", "sleep", "sad") and f._emotion != emotion and self._life_can_speak():
+            f.set_emotion(emotion)
 
     def _is_privileged_action_allowed(self, action_name, speaker_name):
         """Gate PC control / self-coding / Instagram posting to the owner's
@@ -639,9 +714,11 @@ class ARIAAgent:
             txt = None
             with self._tts_lock:
                 if self._tts_q:
+                    self._tts_busy.set()
                     txt = self._tts_q.pop(0)
+                    if not txt:
+                        self._tts_busy.clear()
             if txt:
-                self._tts_busy.set()
                 self.stop_tts.clear()
 
                 # Strip [TAG] tokens before speaking — they're for the face, not TTS
@@ -733,7 +810,14 @@ class ARIAAgent:
         in_dev = get_in_dev()
         in_sr = best_sr(in_dev)
         in_chunk = int(CHUNK * (in_sr / SR))
-        thresh   = CFG.get("wake_threshold", 0.5)
+        # Deliberately NOT the same as the normal wake_threshold: BMO's own
+        # voice (it says its own name constantly) bleeds into the mic while
+        # speaking, so a threshold tuned low enough for reliable real wake-ups
+        # in a quiet room will also self-trigger on BMO's own TTS output and
+        # cut its own sentence off. This listener only needs to catch a loud,
+        # deliberate "hey bmo" over BMO's own speaker — so it gets its own,
+        # much stricter threshold instead of inheriting the tuned-down one.
+        thresh   = CFG.get("wake_threshold_during_tts", 0.6)
 
         try:
             with sd.InputStream(samplerate=in_sr, channels=1, dtype="int16",
@@ -741,11 +825,11 @@ class ARIAAgent:
                 while self._tts_q or self._tts_busy.is_set():
                     if self.interrupted.is_set():
                         break
-                    
+
                     if stream.read_available < in_chunk:
                         sd.sleep(10)
                         continue
-                        
+
                     data, _ = stream.read(in_chunk)
                     audio   = np.frombuffer(data, dtype=np.int16)
                     if audio.ndim > 1:
@@ -754,7 +838,7 @@ class ARIAAgent:
                         step  = len(audio) / CHUNK
                         idx   = np.arange(0, len(audio), step)[:CHUNK].astype(int)
                         audio = audio[idx]
-                    
+
                     if np.max(np.abs(audio)) > 20:
                         self.oww.predict(audio)
                         for m in self.oww.prediction_buffer:
@@ -783,10 +867,12 @@ class ARIAAgent:
 
         if not self.oww:
             while True:
-                if self._checkin_pending and not self._tts_busy.is_set() and not self._tts_q:
-                    return "WAKE"
+                if self._listen_for_reply and self._tts_idle():
+                    self._listen_for_reply = False
+                    return "REPLY"
                 if self.ptt_ev.wait(timeout=0.5):
                     self.ptt_ev.clear()
+                    self._listen_for_reply = False
                     return "PTT"
 
         CHUNK = 1280
@@ -794,18 +880,22 @@ class ARIAAgent:
         in_dev = get_in_dev()
         in_sr = best_sr(in_dev)
         in_chunk = int(CHUNK * (in_sr / SR))
-        thresh   = CFG.get("wake_threshold", 0.5)
+        thresh     = CFG.get("wake_threshold", 0.5)
+        thresh_tts = CFG.get("wake_threshold_during_tts", 0.6)
+        last_tts   = 0.0  # BMO also talks while idle: alarms, check-ins, its inner life
 
         try:
             with sd.InputStream(samplerate=in_sr, channels=1, dtype="int16",
                                  blocksize=in_chunk, device=in_dev) as stream:
                 while True:
-                    if self._checkin_pending and not self._tts_busy.is_set() and not self._tts_q:
-                        # BMO just finished asking the nightly check-in question — start
-                        # listening for the answer immediately, no wake word needed.
-                        return "WAKE"
+                    if self._listen_for_reply and self._tts_idle():
+                        # BMO just asked something on its own — listen once for
+                        # the answer, no wake word needed.
+                        self._listen_for_reply = False
+                        return "REPLY"
                     if self.ptt_ev.is_set():
                         self.ptt_ev.clear()
+                        self._listen_for_reply = False
                         return "PTT"
                     data, _ = stream.read(in_chunk)
                     audio   = np.frombuffer(data, dtype=np.int16)
@@ -816,14 +906,28 @@ class ARIAAgent:
                         step  = len(audio) / CHUNK
                         idx   = np.arange(0, len(audio), step)[:CHUNK].astype(int)
                         audio = audio[idx]
+
+                    speaking = not self._tts_idle()
+                    if speaking:
+                        last_tts = time.time()
+                    elif last_tts and time.time() - last_tts > 1.0:
+                        # BMO's own voice lingers in the wake model's window right
+                        # after it stops; flush it before going back to sensitive.
+                        self.oww.reset()
+                        last_tts = 0.0
+                    cur_thresh = thresh_tts if last_tts else thresh
+
                     if np.max(np.abs(audio)) > 20:
                         self.oww.predict(audio)
                         for m in self.oww.prediction_buffer:
                             score = list(self.oww.prediction_buffer[m])[-1]
-                            if score > thresh:
+                            if score > cur_thresh:
                                 print(f"\n[WAKE] '{m}' score={score:.2f}",
                                       flush=True)
                                 self.oww.reset()
+                                if speaking:
+                                    self._stop_speaking()
+                                self._listen_for_reply = False
                                 return "WAKE"
         except Exception as e:
             print(f"[WAKE] Stream error: {e}", flush=True)
@@ -842,6 +946,7 @@ class ARIAAgent:
         sil_thresh = CFG.get("silence_threshold", 0.006)
         sil_dur    = CFG.get("silence_duration",   1.5)
         max_t      = CFG.get("max_record_seconds", 25)
+        self._last_rec_evidence = None
 
         if ptt:
             def cb(d, f, t, s): buf.append(d.copy())
@@ -854,19 +959,26 @@ class ARIAAgent:
             except Exception as e:
                 print(f"[REC] PTT error: {e}", flush=True)
         else:
-            chunk_d  = 0.03          # 30ms chunks — tighter silence detection
+            chunk_d  = 0.03          # 30ms chunks — also a valid webrtcvad frame length
             chunk_sz = int(sr * chunk_d)
             n_sil    = int(sil_dur / chunk_d)
             n_max    = int(max_t / chunk_d)
             sil_cnt  = 0
             rec_cnt  = 0
             done     = False
+            ep = Endpointer(sr, silence_s=sil_dur,
+                            no_speech_s=CFG.get("no_speech_timeout", 3.5))
 
             def cb(d, f, t, s):
                 nonlocal sil_cnt, rec_cnt, done
-                vol = np.linalg.norm(d) / max(np.sqrt(len(d)), 1)
                 buf.append(d.copy())
                 rec_cnt += 1
+                if ep.available:
+                    if ep.push(d[:, 0]):
+                        done = True
+                    return
+                # Loudness fallback, only when webrtcvad can't run.
+                vol = np.linalg.norm(d) / max(np.sqrt(len(d)), 1)
                 # Ignore silence for the first ~450ms to give user time to start
                 if rec_cnt < 15:
                     return
@@ -889,8 +1001,13 @@ class ARIAAgent:
                         sd.sleep(int(chunk_d * 1000))
                 
                 duration = rec_cnt * chunk_d
-                avg_vol = np.mean(vols) if vols else 0
-                print(f"[REC] Finished. Duration: {duration:.1f}s, Avg Vol: {avg_vol:.5f}", flush=True)
+                if ep.available:
+                    self._last_rec_evidence = ep.evidence
+                    print(f"[REC] Finished. Duration: {duration:.1f}s, speech: {ep.voiced_seconds:.1f}s "
+                          f"({ep.evidence})", flush=True)
+                else:
+                    avg_vol = np.mean(vols) if vols else 0
+                    print(f"[REC] Finished. Duration: {duration:.1f}s, Avg Vol: {avg_vol:.5f}", flush=True)
             except Exception as e:
                 print(f"[REC] Adaptive error: {e}", flush=True)
 
@@ -930,7 +1047,7 @@ class ARIAAgent:
             )
         else:
             self.enqueue(
-                f"Beemo online. All systems nominal. Say {ww} to activate."
+                f"Hey hey, it's BMO! I'm alive and I'm awesome — say {ww} if you wanna talk to me!"
             )
 
         # Warm up Ollama in background only if Groq is not active to prevent low-voltage/RAM spikes
@@ -944,6 +1061,7 @@ class ARIAAgent:
                 pass
         threading.Thread(target=warm_brain, daemon=True).start()
         self._wait_tts()
+        self.life.start()
 
         skip_trigger = False
         while True:
@@ -966,27 +1084,52 @@ class ARIAAgent:
                     self._set_state(S.IDLE, "No audio detected.")
                     continue
 
+                # Always transcribe: on this mic a voice across the room sits barely
+                # above the fan noise, where the VAD can't see it but Whisper can.
+                evidence = self._last_rec_evidence
+                faint = evidence in ("weak", "none")
+
                 self._set_state(S.THINK, "Thinking...")
 
-                # Speaker ID runs in parallel with STT — adds zero serial latency
+                # Speaker ID (voice) and face ID (camera) both run in parallel
+                # with STT — adds zero serial latency either way.
                 _speaker_box = {}
                 def _id_worker(_wav=wav):
                     _speaker_box["name"] = self.voiceid.identify(_wav)
                 _id_thread = threading.Thread(target=_id_worker, daemon=True)
                 _id_thread.start()
 
+                _face_box = {}
+                def _face_worker():
+                    _face_box["name"] = self.faceid.identify()
+                _face_thread = threading.Thread(target=_face_worker, daemon=True)
+                _face_thread.start()
+
                 t_stt0 = time.time()
                 user_text = self.stt.run(wav)
                 print(f"[TIMING] STT: {time.time()-t_stt0:.2f}s", flush=True)
                 _id_thread.join(timeout=2.0)
-                speaker_name = _speaker_box.get("name")
+                _face_thread.join(timeout=2.0)
+                # Voice ID wins when both fire — it's cheaper and already
+                # proven out; face ID just fills in when the voice is unknown.
+                speaker_name = _speaker_box.get("name") or _face_box.get("name")
+                if user_text and not re.search(r"[^\W_]", user_text):
+                    user_text = ""  # punctuation only, e.g. "." from noise
+                if user_text and faint and is_whisper_phantom(user_text):
+                    print(f"[STT] Ignoring '{user_text}': what Whisper hears in silence.", flush=True)
+                    user_text = ""
                 if not user_text:
-                    self.enqueue("I did not detect any speech. Please repeat.")
-                    skip_trigger = self._wait_tts()
+                    if faint:
+                        self._no_speech(src)
+                    else:
+                        self.enqueue("I did not detect any speech. Please repeat.")
+                        skip_trigger = self._wait_tts()
                     continue
 
                 print(f"[USER] {user_text}" + (f" (speaker: {speaker_name})" if speaker_name else ""), flush=True)
                 self.interrupted.clear()
+                life_ctx, life_fu = self.life.context_for(speaker_name)
+                self.life.on_user_interaction(speaker_name, user_text)
 
                 low = user_text.lower()
 
@@ -1011,6 +1154,9 @@ class ARIAAgent:
                 is_interrupt = False
                 if any(x in low for x in ["stop", "cancel", "be quiet", "shut up"]):
                     self._do_interrupt()
+                    # Already acted on; left set, it would cut this command's reply
+                    # short and swallow the next wake word.
+                    self.interrupted.clear()
                     is_interrupt = True
 
                 # Memory commands
@@ -1023,6 +1169,29 @@ class ARIAAgent:
                 if any(x in low for x in ["read my journal", "check my journal", "what's in my journal",
                                            "how have i been", "journal recap", "how have i been feeling"]):
                     self.enqueue(self.journal.summary())
+                    skip_trigger = self._wait_tts()
+                    continue
+
+                # ── Inner life: quiet mode, BMO's own day and diary ─────────
+                # ("chill" is taken — it starts lo-fi ambient mode.)
+                if re.search(r"\b(?:you can talk again|quiet mode off|talk to me again)\b", low):
+                    self.life.end_quiet()
+                    self.enqueue("Yay! BMO is back!")
+                    skip_trigger = self._wait_tts()
+                    continue
+                if re.search(r"\b(?:quiet mode|stop talking to yourself|leave me alone|"
+                             r"give me some space|be quiet for a while)\b", low):
+                    self.life.set_quiet(hours=3)
+                    self.enqueue("Okay. BMO will be quiet for a while. Say you can talk again when you miss me.")
+                    skip_trigger = self._wait_tts()
+                    continue
+                if re.search(r"\bhow (?:was|is|'s) your day\b|\bhow'?s your day\b|\bwhat did you do today\b", low):
+                    self._set_state(S.THINK, "Remembering my day...")
+                    self.enqueue(self.life.todays_story())
+                    skip_trigger = self._wait_tts()
+                    continue
+                if re.search(r"\b(?:read|tell) me your diary\b|\bread your diary\b|\bwhat did you do yesterday\b", low):
+                    self.enqueue(self.life.diary(days_ago=1))
                     skip_trigger = self._wait_tts()
                     continue
 
@@ -1054,6 +1223,28 @@ class ARIAAgent:
                         self.enqueue(f"You're {speaker_name} — I'd know that voice anywhere!")
                     else:
                         self.enqueue("I don't recognize your voice yet. Say 'remember my voice as' and your name!")
+                    skip_trigger = self._wait_tts()
+                    continue
+
+                # ── Face recognition (face ID) ──────────────────────────────
+                _enroll_face_m = re.search(r"remember (?:my face|what i look like) as ([a-zA-Z]+)", low)
+                if _enroll_face_m:
+                    enroll_face_name = _normalize_name(_enroll_face_m.group(1).capitalize())
+                    self._set_state(S.THINK, "Learning your face...")
+                    self.enqueue(self.faceid.enroll(enroll_face_name))
+                    skip_trigger = self._wait_tts()
+                    continue
+
+                _forget_face_m = re.search(r"forget ([a-zA-Z]+)'?s face", low)
+                if _forget_face_m:
+                    forget_face_name = _normalize_name(_forget_face_m.group(1).capitalize())
+                    self.enqueue(self.faceid.forget(forget_face_name))
+                    skip_trigger = self._wait_tts()
+                    continue
+
+                if any(x in low for x in ["whose faces do you know", "who do you recognize by face",
+                                           "what faces do you know"]):
+                    self.enqueue(self.faceid.list_known())
                     skip_trigger = self._wait_tts()
                     continue
 
@@ -1107,6 +1298,7 @@ class ARIAAgent:
                         continue
                     self._set_state(S.THINK, "Executing action...")
                     result = self.skills.route(fast_action, original_query=user_text)
+                    self.life.on_action(action_name)
                     if result:
                         self.enqueue(result)
                     else:
@@ -1143,7 +1335,10 @@ class ARIAAgent:
                 else:
                     prompt_with_emotion = user_text + "\n" + ooc_instruction
                 if speaker_name:
-                    prompt_with_emotion = f"(OOC: The person currently speaking is {speaker_name}, by voice recognition — greet or address them by name if it feels natural, don't force it.)\n" + prompt_with_emotion
+                    prompt_with_emotion = f"(OOC: The person currently speaking is {speaker_name} — greet or address them by name if it feels natural, don't force it.)\n" + prompt_with_emotion
+                if life_ctx:
+                    prompt_with_emotion = life_ctx + prompt_with_emotion
+                    self.life.followup_asked(life_fu)
                 reply = self.ai.ask(prompt_with_emotion)
                 print(f"[TIMING] LLM: {time.time()-t_llm0:.2f}s | Reply: {reply}", flush=True)
                 self.semantic_memory.remember_async(user_text)  # background — never blocks the reply

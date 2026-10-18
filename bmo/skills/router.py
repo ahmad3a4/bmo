@@ -14,6 +14,8 @@ from bmo.skills.spotify import SpotifySkill
 from bmo.skills.pc_control import PCControlSkill
 from bmo.skills.home_assistant import HomeAssistantSkill
 from bmo.skills.notes import NotesSkill
+from bmo.skills.vision import VisionSkill
+from bmo.skills.selfie import SelfieSkill
 from bmo.skills.misc import (
     get_weather, web_search, get_news, set_system_volume,
     get_joke, get_fact, get_bored_activity, calculate, get_system_status,
@@ -67,6 +69,10 @@ class SkillsRouter:
 
         # ── Notes / Reminders ────────────────────────────────────────────
         self.notes = NotesSkill(MEMORY_FILE)
+
+        # ── Vision (camera) ──────────────────────────────────────────────
+        self.vision = VisionSkill(cfg)
+        self.selfie = SelfieSkill(speak=timer_cb, get_media=lambda: self.media)
 
         self._routes = self._build_routes()
 
@@ -247,6 +253,11 @@ class SkillsRouter:
             "home_toggle":        lambda ad: self.ha.toggle(ad.get("entity", "switch.main")),
             "home_status":        lambda ad: self.ha.status(ad.get("entity", "")),
             "home_list_entities": lambda ad: self.ha.list_entities(),
+
+            # ── Vision (camera) ───────────────────────────────────────────
+            "vision_describe": lambda ad: self.vision.describe(ad.get("question", "")),
+            "vision_roast":    lambda ad: self.vision.roast(),
+            "take_selfie":     lambda ad: self.selfie.take(),
 
             # ── Bored Activity ────────────────────────────────────────────
             "bored_activity": lambda ad: get_bored_activity(),

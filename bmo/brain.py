@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """BMO Brain — STT + LLM (Groq/Ollama) + TTS (Piper)"""
-import os, re, time, subprocess, shutil, json
+import os, re, time, subprocess, shutil, json, threading, wave
+import numpy as np
 import whisper, ollama, requests
 
 from bmo.paths import MEMORY_FILE, JOURNAL_FILE, VOICES_DIR
@@ -21,7 +22,12 @@ BMO_SYSTEM_PROMPT_BASE = (
     "CRITICAL: You are having this exact conversation because a specific voice command (Spotify, PC control, "
     "TV, launching an app, lights, etc.) did NOT match — you have no way to actually control any of that "
     "yourself. If the user asks you to do something physical/technical, do NOT claim you did it or pretend it "
-    "worked — say you're not sure how to do that one and suggest they rephrase (e.g. 'try open/launch/run X on my pc')."
+    "worked — say you're not sure how to do that one and suggest they rephrase (e.g. 'try open/launch/run X on my pc'). "
+    "IMPORTANT: You DO have a camera — your little camera eye — and can actually see when asked to look. "
+    "NEVER say you don't have a camera, eyes, or can't see. If this exact question is about seeing/looking/what "
+    "someone looks like and you're seeing this instead of a real camera answer, it just means your camera "
+    "didn't catch that exact phrasing — tell them to ask again more directly, like 'what do you see' or "
+    "'take a look at me', don't deny having eyes."
 )
 
 # Written natively in Arabic (not translated) so replies come out sounding like
@@ -387,6 +393,12 @@ class BMOBrain:
                 return result
         return "Sorry, my brain is offline. Check your internet or start Ollama."
 
+    def note_spoken(self, text):
+        """Record something BMO said unprompted, so a reply to it has context."""
+        for ai in (self.groq, self.ollama):
+            if ai:
+                ai.history.append({"role": "assistant", "content": text})
+
     def summarise(self, context, question):
         if self.groq:
             result = self.groq.summarise(context, question)
@@ -413,6 +425,16 @@ class BMOBrain:
 
 # ─── STT ─────────────────────────────────────────────────────────────────────
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+# What Whisper "hears" in silence and room noise. Measured on this mic: digital
+# silence and fan noise both came back as "Thank you." (Groq's no_speech_prob is
+# always 0, so it can't be used to catch these).
+_WHISPER_PHANTOMS = {"", "you", "bye", "thank you", "thanks for watching",
+                     "thank you for watching", "thank you so much", "thank you very much"}
+
+
+def is_whisper_phantom(text):
+    return re.sub(r"[^a-z ]", "", (text or "").lower()).strip() in _WHISPER_PHANTOMS
 
 class STT:
     def __init__(self, model_name="tiny.en", groq_api_key="", language="en"):
@@ -475,42 +497,43 @@ class STT:
 
 
 # ─── TTS (Piper + robotic FX) ────────────────────────────────────────────────
+ROBOT_FX = ["pitch", "-180", "echo", "0.8", "0.7", "35", "0.18", "phaser", "0.8", "0.74", "3", "0.35", "0.5"]
+
+
+def _close_quietly(f):
+    try:
+        f.close()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+
 class ARIAVoice:
     def __init__(self, voice_model="en_GB-alan-medium", robotic_fx=True, voices_dir=None):
         self.robotic_fx  = robotic_fx
         self.voices_dir  = voices_dir or VOICES_DIR
         self.voice_onnx  = os.path.join(self.voices_dir, f"{voice_model}.onnx")
-        self.has_piper   = shutil.which("piper") is not None
         self.has_sox     = shutil.which("sox")   is not None
         self.has_aplay   = shutil.which("aplay") is not None
         self._proc       = None
-        self._piper_proc = None
         self._p_sox      = None
-        self._piper_lock = __import__("threading").Lock()
+        self._piper_lock = threading.Lock()
         self._aplay_dev  = self._get_aplay_device()
-        if not self.has_piper:
-            print("[TTS] piper not found — using espeak.", flush=True)
-        elif not os.path.exists(self.voice_onnx):
+        # In-process, not a `piper` subprocess: a subprocess never signals where an
+        # utterance ends, so say() had to wait out 1.5 s of silence before every line.
+        self._piper = None
+        if not os.path.exists(self.voice_onnx):
             print(f"[TTS] Voice model not found: {self.voice_onnx}", flush=True)
         else:
-            print(f"[TTS] Piper ready. Voice: {voice_model}", flush=True)
-            self._ensure_piper()
+            try:
+                from piper import PiperVoice
+                self._piper = PiperVoice.load(self.voice_onnx)
+                print(f"[TTS] Piper ready. Voice: {voice_model}", flush=True)
+            except Exception as e:
+                print(f"[TTS] Piper unavailable ({e}) — using espeak.", flush=True)
+        self.has_piper = self._piper is not None
         if not self.has_sox:
             print("[TTS] sox not found — robotic FX disabled.", flush=True)
             self.robotic_fx = False
-
-    def _ensure_piper(self):
-        if self._piper_proc and self._piper_proc.poll() is None:
-            return
-        try:
-            self._piper_proc = subprocess.Popen(
-                ["piper", "--model", self.voice_onnx, "--output_raw"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, bufsize=0)
-            print("[TTS] Piper process warm (persistent).", flush=True)
-        except Exception as e:
-            print(f"[TTS] Piper start failed: {e}", flush=True)
-            self._piper_proc = None
 
     def _get_aplay_device(self):
         if not self.has_aplay:
@@ -532,149 +555,27 @@ class ARIAVoice:
         return "default"
 
     def say(self, text, stop_event=None, on_start=None):
-        clean = re.sub(r"[^\w\s,.!?:'\"\-]", "", text).strip()
+        # Turn dashes into pauses and drop other symbols as spaces; deleting them
+        # glued words together ("BMO—your" was spoken as "BMOyour").
+        clean = (text.replace("—", ", ").replace("–", ", ")
+                     .replace("‑", "-").replace("‐", "-").replace("’", "'"))
+        clean = re.sub(r"[^\w\s,.!?:'\"\-]", " ", clean)
+        clean = re.sub(r"[ \t]+", " ", clean).strip()
         if not clean:
             return
-        clean = re.sub(r"([.!?])\s+", r"\1\n", clean) + "\n"
-
         def _fire_start():
             trunc = "..." if len(clean) > 70 else ""
             print(f"[TTS] '{clean[:70]}{trunc}'", flush=True)
             if on_start:
                 on_start()
 
-        if self.has_piper and os.path.exists(self.voice_onnx) and self.has_aplay:
+        if self._piper and self.has_aplay:
             try:
-                import select
                 with self._piper_lock:
-                    self._ensure_piper()
-                    piper = self._piper_proc
-                    if piper is None:
-                        raise RuntimeError("Piper unavailable")
-                    piper.stdin.write(clean.encode())
-                    piper.stdin.flush()
-                    if self.robotic_fx and self.has_sox:
-                        self._p_sox = subprocess.Popen(
-                            ["sox", "--buffer", "8192", "-t", "raw", "-r", "22050", "-e", "signed",
-                             "-b", "16", "-c", "1", "-",
-                             "-t", "raw", "-",
-                             "pitch", "-180",
-                             "echo",   "0.8", "0.7", "35", "0.18",
-                             "phaser", "0.8", "0.74", "3", "0.35", "0.5"],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, bufsize=65536)
-                        stream_in  = self._p_sox.stdin
-                        stream_out = self._p_sox.stdout
-                    else:
-                        self._p_sox = None
-                        stream_in = stream_out = None
-                    self._proc = subprocess.Popen(
-                        ["aplay", "-D", self._aplay_dev, "-r", "22050",
-                         "-f", "S16_LE", "-c", "1", "-q", "--buffer-time=500000"],
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=65536)
-                    piper_out = piper.stdout
-                    aplay_in  = self._proc.stdin
-                    os.set_blocking(piper_out.fileno(), False)
-                    first = True
-                    idle_cnt = 0
-                    IDLE_MAX = 150  # 1.5 seconds timeout to allow Piper to process commas/hyphens
-
-                    if self._p_sox:
-                        import threading
-                        os.set_blocking(stream_out.fileno(), True)
-                        sox_first = True
-                        def sox_to_aplay_worker():
-                            nonlocal sox_first
-                            try:
-                                for chunk in iter(lambda: stream_out.read(8192), b""):
-                                    if stop_event and stop_event.is_set():
-                                        break
-                                    if sox_first:
-                                        _fire_start()
-                                        sox_first = False
-                                    try:
-                                        aplay_in.write(chunk)
-                                        aplay_in.flush()
-                                    except Exception:
-                                        break
-                            except Exception:
-                                pass
-                        t_sox = threading.Thread(target=sox_to_aplay_worker, daemon=True)
-                        t_sox.start()
-                    else:
-                        t_sox = None
-
-                    while True:
-                        if stop_event and stop_event.is_set():
-                            break
-                        # Use slightly larger timeout when waiting for the first chunk to let Piper warm up without 100% CPU spinning
-                        t_out = 0.05 if first else 0.01
-                        r, _, _ = select.select([piper_out], [], [], t_out)
-                        if r:
-                            try:
-                                chunk = piper_out.read(8192)
-                            except BlockingIOError:
-                                continue
-                            if chunk:
-                                idle_cnt = 0
-                                if first:
-                                    if not self._p_sox:
-                                        _fire_start()
-                                    first = False
-                                dest = stream_in if self._p_sox else aplay_in
-                                try:
-                                    dest.write(chunk)
-                                    dest.flush()
-                                except Exception:
-                                    break
-                            else:
-                                break
-                        else:
-                            if first:
-                                continue
-                            idle_cnt += 1
-                        if idle_cnt >= IDLE_MAX:
-                            break
-                    if self._p_sox:
-                        try:
-                            stream_in.close()
-                        except Exception:
-                            pass
-                        if stop_event and stop_event.is_set():
-                            try: self._p_sox.terminate()
-                            except Exception: pass
-                            try: self._proc.terminate()
-                            except Exception: pass
-                        if t_sox:
-                            t_sox.join()
-                        try:
-                            self._p_sox.wait()
-                        except Exception:
-                            pass
-                    try:
-                        aplay_in.close()
-                    except Exception:
-                        pass
-                    if stop_event and stop_event.is_set():
-                        if self._p_sox:
-                            try: self._p_sox.terminate()
-                            except Exception: pass
-                        try: self._proc.terminate()
-                        except Exception: pass
-                    else:
-                        self._proc.wait()
-                    self._proc = None
-                    self._p_sox = None
-                    return
+                    self._speak_piper(clean, stop_event, _fire_start)
+                return
             except Exception as e:
-                print(f"[TTS] Piper error: {e} — restarting.", flush=True)
-                try:
-                    if self._piper_proc:
-                        self._piper_proc.terminate()
-                except Exception:
-                    pass
-                self._piper_proc = None
+                print(f"[TTS] Piper error: {e} — falling back to espeak.", flush=True)
 
         try:
             args = ["espeak", "-ven+f3", "-s160", "-p30", clean]
@@ -687,6 +588,101 @@ class ARIAVoice:
             self._proc = None
         except Exception as e:
             print(f"[TTS] espeak error: {e}", flush=True)
+
+    def _speak_piper(self, text, stop_event, fire_start):
+        stopped = lambda: stop_event is not None and stop_event.is_set()
+        # Start playing once 0.1 s is buffered. aplay's default waits for its whole
+        # 0.5 s buffer, which a short reply never fills, so it stayed silent until the end.
+        aplay = subprocess.Popen(
+            ["aplay", "-D", self._aplay_dev, "-r", "22050", "-f", "S16_LE", "-c", "1", "-q",
+             "--buffer-time=500000", "--start-delay=100000"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._proc = aplay
+        sox = pump = None
+        if self.robotic_fx and self.has_sox:
+            sox = subprocess.Popen(
+                ["sox", "--buffer", "2048", "-t", "raw", "-r", "22050", "-e", "signed", "-b", "16",
+                 "-c", "1", "-", "-t", "raw", "-"] + ROBOT_FX,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._p_sox = sox
+
+            def _pump():  # sox -> aplay; sox's first output is when the voice really starts
+                first = True
+                for chunk in iter(lambda: sox.stdout.read1(4096), b""):
+                    if stopped():
+                        break
+                    if first:
+                        fire_start()
+                        first = False
+                    try:
+                        aplay.stdin.write(chunk)
+                        aplay.stdin.flush()
+                    except (BrokenPipeError, ValueError, OSError):
+                        break
+            pump = threading.Thread(target=_pump, daemon=True)
+            pump.start()
+
+        try:
+            dest = sox.stdin if sox else aplay.stdin
+            first = True
+            # Played as 22050 Hz even for a 32 kHz model — that's part of how BMO sounds.
+            for chunk in self._piper.synthesize(text):
+                if stopped():
+                    break
+                if first and not sox:
+                    fire_start()
+                first = False
+                dest.write(chunk.audio_int16_bytes)
+                dest.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass  # stop() killed the pipeline mid-line
+        finally:
+            if sox:
+                _close_quietly(sox.stdin)
+                pump.join(timeout=10)
+            _close_quietly(aplay.stdin)
+            if stopped():
+                self.stop()
+            else:
+                aplay.wait()
+            self._proc = None
+            self._p_sox = None
+
+    def render_clips(self, texts, out_dir):
+        """Pre-render lines to WAVs in the same voice as say(), for sounds that must play
+        exactly on cue (live speech lags by Piper + FX + aplay buffering). {text: path}."""
+        if not self._piper:
+            return {}
+        os.makedirs(out_dir, exist_ok=True)
+        clips = {}
+        try:
+            for i, text in enumerate(texts):
+                with self._piper_lock:
+                    pcm = np.frombuffer(b"".join(c.audio_int16_bytes for c in self._piper.synthesize(text)),
+                                        dtype=np.int16)
+                loud = np.nonzero(np.abs(pcm) > 0.02 * max(1, int(np.abs(pcm).max())))[0]
+                if len(loud):
+                    pcm = pcm[max(0, loud[0] - 220):]  # drop leading silence so it starts on cue
+                dst = os.path.join(out_dir, f"clip{i}.wav")
+                # Same 22050 Hz playback as say(), whatever the model's own rate.
+                if self.robotic_fx and self.has_sox:
+                    subprocess.run(["sox", "-t", "raw", "-r", "22050", "-e", "signed", "-b", "16",
+                                    "-c", "1", "-", dst] + ROBOT_FX,
+                                   input=pcm.tobytes(), capture_output=True, timeout=30, check=True)
+                else:
+                    with wave.open(dst, "wb") as w:
+                        w.setnchannels(1)
+                        w.setsampwidth(2)
+                        w.setframerate(22050)
+                        w.writeframes(pcm.tobytes())
+                clips[text] = dst
+        except Exception as e:
+            print(f"[TTS] Clip render failed: {e}", flush=True)
+        return clips
+
+    def play_file(self, path):
+        return subprocess.Popen(["aplay", "-D", self._aplay_dev, "-q", path],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def stop(self):
         if self._proc and self._proc.poll() is None:
@@ -704,13 +700,6 @@ class ARIAVoice:
 
     def shutdown(self):
         self.stop()
-        if self._piper_proc:
-            try:
-                self._piper_proc.terminate()
-                self._piper_proc.wait(timeout=2)
-            except Exception:
-                pass
-        self._piper_proc = None
 
 
 # ─── Groq Orpheus (native Arabic TTS, cloud) ─────────────────────────────────

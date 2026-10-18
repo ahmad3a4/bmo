@@ -150,6 +150,7 @@ class MediaDisplay:
         self._tk_img    = None          # tk.PhotoImage ref (prevent GC)
         self._active    = False
         self._lock      = threading.Lock()
+        self._frame_pending = False
 
         os.makedirs(self.TMP_DIR, exist_ok=True)
 
@@ -248,6 +249,47 @@ class MediaDisplay:
     def is_active(self) -> bool:
         """Return True if an image is currently being displayed."""
         return self._active
+
+    def show_frame(self, img):
+        """Show a PIL image now (live camera preview). Frames arriving while the
+        previous one is still being drawn are dropped so Tk never falls behind.
+        Returns False when the frame was dropped."""
+        if not self._canvas or not HAS_TK or not HAS_PIL:
+            return False
+        with self._lock:
+            if self._frame_pending:
+                return False
+            self._frame_pending = True
+
+        def _render():
+            try:
+                c = self._canvas
+                w = c.winfo_width() or 800
+                h = c.winfo_height() or 480
+                frame = img.copy()
+                frame.thumbnail((w, h - 60), Image.LANCZOS)
+                tk_img = ImageTk.PhotoImage(frame)
+                with self._lock:
+                    if self._img_id and c.type(self._img_id):
+                        c.itemconfigure(self._img_id, image=tk_img)
+                    else:
+                        self._img_id = c.create_image(w // 2, (h - 60) // 2, image=tk_img, anchor="center")
+                    self._tk_img = tk_img
+                    self._active = True
+            except Exception as e:
+                print(f"[MEDIA] Frame error: {e}", flush=True)
+            finally:
+                with self._lock:
+                    self._frame_pending = False
+
+        try:
+            self._canvas.after(0, _render)
+            return True
+        except Exception as e:
+            print(f"[MEDIA] Schedule error: {e}", flush=True)
+            with self._lock:
+                self._frame_pending = False
+            return False
 
     # ─── Internal rendering ──────────────────────────────────────────────────
 

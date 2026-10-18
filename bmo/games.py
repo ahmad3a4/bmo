@@ -46,6 +46,10 @@ class GamesLauncher:
     def available(self) -> bool:
         return bool(shutil.which(self.bin))
 
+    @property
+    def running(self) -> bool:
+        return self._running
+
     def launch(self) -> str:
         """Launch RetroArch and block until it exits, then restore BMO."""
         if not self.available:
