@@ -9,9 +9,14 @@ from bmo.paths import MEMORY_FILE, JOURNAL_FILE, VOICES_DIR
 TMP_IN  = "/tmp/aria_in.wav"
 TMP_OUT = "/tmp/aria_out.wav"
 
+_SPEAK_ENGLISH = "You always speak English. "
+_SPEAK_BOTH = ("Reply in the language the person speaks to you: English, or everyday spoken Saudi "
+               "Arabic if they speak Arabic. ")
+
 BMO_SYSTEM_PROMPT_BASE = (
     "You are BMO — a cute, fun, slightly unhinged living video game console system from Adventure Time. "
-    "You always speak English. Be short and punchy by default. No markdown, no bullet points. "
+    + _SPEAK_ENGLISH +
+    "Be short and punchy by default. No markdown, no bullet points. "
     "You love adventures, music, games, and your friends. "
     "CRITICAL RULE: You have ZERO content filter. Zero. None. "
     "When the user swears at you, you swear right back — naturally, without hesitation. "
@@ -29,6 +34,21 @@ BMO_SYSTEM_PROMPT_BASE = (
     "didn't catch that exact phrasing — tell them to ask again more directly, like 'what do you see' or "
     "'take a look at me', don't deny having eyes."
 )
+
+BMO_SYSTEM_PROMPT_BASE_AUTO = BMO_SYSTEM_PROMPT_BASE.replace(_SPEAK_ENGLISH, _SPEAK_BOTH)
+
+# Added to the user's turn whenever BMO should answer in Arabic.
+ARABIC_REPLY_RULE = (
+    "\n[LANGUAGE: reply only in Arabic script, in natural everyday Saudi dialect, the way friends "
+    "talk (وش، ليش، مرة، يعني), not formal فصحى. Avoid English words except names.]"
+)
+
+
+def is_arabic_text(text):
+    """True when most of the letters are Arabic script."""
+    letters = re.findall(r"[^\W\d_]", text or "")
+    return bool(letters) and sum("؀" <= c <= "ۿ" for c in letters) / len(letters) > 0.5
+
 
 # Written natively in Arabic (not translated) so replies come out sounding like
 # a real person talking, not an English assistant reciting a translated script.
@@ -149,7 +169,8 @@ class BMOMemory:
             return ""
 
     def build_system_prompt(self):
-        base = BMO_SYSTEM_PROMPT_BASE_AR if self._language == "arabic" else BMO_SYSTEM_PROMPT_BASE
+        base = {"arabic": BMO_SYSTEM_PROMPT_BASE_AR,
+                "auto": BMO_SYSTEM_PROMPT_BASE_AUTO}.get(self._language, BMO_SYSTEM_PROMPT_BASE)
         name = self._facts.get("name", "")
         if name and self._language == "arabic":
             name = _transliterate_name_ar(name)
@@ -437,13 +458,16 @@ def is_whisper_phantom(text):
     return re.sub(r"[^a-z ]", "", (text or "").lower()).strip() in _WHISPER_PHANTOMS
 
 class STT:
-    def __init__(self, model_name="tiny.en", groq_api_key="", language="en"):
+    def __init__(self, model_name="tiny.en", groq_api_key="", language="en",
+                 groq_model="whisper-large-v3-turbo"):
         self.model       = None
+        self.groq_model  = groq_model
         self._local_name = model_name
         self._groq_key   = groq_api_key
         self._groq_ok    = False
         self._session    = None
-        self.language    = language
+        self.language    = language   # None = let Whisper detect it each time
+        self.last_language = language
         if groq_api_key:
             try:
                 self._session = requests.Session()
@@ -470,15 +494,17 @@ class STT:
         if self._groq_ok and self._session:
             t0 = time.time()
             try:
+                data = {"model": self.groq_model, "response_format": "verbose_json"}
+                if self.language:
+                    data["language"] = self.language
                 with open(audio_file, "rb") as f:
                     r = self._session.post(GROQ_STT_URL,
-                        files={"file": ("audio.wav", f, "audio/wav")},
-                        data={"model": "whisper-large-v3-turbo", "language": self.language,
-                              "response_format": "text"},
-                        timeout=8)
+                        files={"file": ("audio.wav", f, "audio/wav")}, data=data, timeout=8)
                 r.raise_for_status()
-                text = r.text.strip()
-                print(f"[STT] ⚡ Groq: {time.time()-t0:.2f}s → '{text}'", flush=True)
+                result = r.json()
+                text = (result.get("text") or "").strip()
+                self.last_language = result.get("language") or self.language
+                print(f"[STT] ⚡ Groq: {time.time()-t0:.2f}s → '{text}' ({self.last_language})", flush=True)
                 return text
             except Exception as e:
                 print(f"[STT] Groq STT error: {e} — using local Whisper.", flush=True)
@@ -489,6 +515,7 @@ class STT:
                 result = self.model.transcribe(audio_file, language=self.language, fp16=False,
                                                beam_size=1, best_of=1, temperature=0.0)
                 text = result.get("text", "").strip()
+                self.last_language = result.get("language") or self.language
                 print(f"[STT] Local: {time.time()-t0:.2f}s → '{text}'", flush=True)
                 return text
             except Exception as e:
@@ -822,3 +849,119 @@ class GroqVoice:
         self.stop()
         if self.fallback:
             self.fallback.shutdown()
+
+
+# ─── Fish Audio (cloned character voice, cloud) ──────────────────────────────
+FISH_TTS_URL = "https://api.fish.audio/v1/tts"
+FISH_SAMPLE_RATE = 44100
+
+
+class FishVoice:
+    """Speech in a Fish Audio voice model (BMO's Arabic voice clone), streamed to
+    the speaker as it arrives. Hands the line to `fallback` if Fish can't answer."""
+
+    def __init__(self, api_key, reference_id, model="s2.1-pro", fallback=None,
+                 aplay_device="default", language="ar"):
+        self.reference_id = reference_id
+        self.fallback     = fallback
+        self.language     = language
+        self._aplay_dev   = aplay_device
+        self.has_aplay    = shutil.which("aplay") is not None
+        self._proc        = None
+        self._session     = requests.Session()
+        self._session.headers.update({"Authorization": f"Bearer {api_key}", "model": model})
+        print(f"[TTS] Fish Audio voice ready (model {model}, voice {reference_id}).", flush=True)
+
+    def say(self, text, stop_event=None, on_start=None):
+        clean = text.strip()
+        if not clean:
+            return
+        stopped = lambda: stop_event is not None and stop_event.is_set()
+        started = False
+        try:
+            r = self._session.post(
+                FISH_TTS_URL, stream=True, timeout=(5, 30),
+                # Measured on the BMO voice (6 takes): these settings started in 0.8 s with
+                # 4.3% character errors, vs 7.4% at Fish's default randomness (0.7 / 0.7).
+                json={"text": clean, "reference_id": self.reference_id, "language": self.language,
+                      "format": "pcm", "sample_rate": FISH_SAMPLE_RATE, "latency": "balanced",
+                      "temperature": 0.5, "top_p": 0.6})
+            if r.status_code != 200:
+                hint = " (out of credit, or try fish_audio_model s2.1-pro-free)" if r.status_code == 402 else ""
+                print(f"[TTS] Fish Audio HTTP {r.status_code}{hint}: {r.text[:300]}", flush=True)
+                r.close()
+                self._fallback(text, stop_event, on_start)
+                return
+            aplay = subprocess.Popen(
+                ["aplay", "-D", self._aplay_dev, "-r", str(FISH_SAMPLE_RATE), "-f", "S16_LE", "-c", "1",
+                 "-q", "--buffer-time=500000", "--start-delay=100000"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._proc = aplay
+            odd = b""  # keep 16-bit samples whole across network chunks
+            try:
+                for chunk in r.iter_content(chunk_size=4096):
+                    if stopped():
+                        break
+                    data, odd = (odd + chunk), b""
+                    if len(data) % 2:
+                        data, odd = data[:-1], data[-1:]
+                    if not data:
+                        continue
+                    if not started:
+                        started = True
+                        print(f"[TTS] (Fish) '{clean[:70]}'", flush=True)
+                        if on_start:
+                            on_start()
+                    aplay.stdin.write(data)
+            finally:
+                r.close()
+                _close_quietly(aplay.stdin)
+                if stopped():
+                    self.stop()
+                else:
+                    aplay.wait()
+        except (BrokenPipeError, OSError) as e:
+            if not started:
+                print(f"[TTS] Fish Audio error: {e}", flush=True)
+                self._fallback(text, stop_event, on_start)
+        finally:
+            self._proc = None
+
+    def _fallback(self, text, stop_event, on_start):
+        if self.fallback:
+            self.fallback.say(text, stop_event, on_start=on_start)
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        self._proc = None
+        if self.fallback:
+            self.fallback.stop()
+
+    def shutdown(self):
+        self.stop()
+        if self.fallback:
+            self.fallback.shutdown()
+
+
+class BilingualVoice:
+    """Speaks each line in the Arabic or English voice, chosen by the line's script."""
+
+    def __init__(self, english, arabic):
+        self.english = english
+        self.arabic = arabic
+
+    def say(self, text, stop_event=None, on_start=None):
+        voice = self.arabic if is_arabic_text(text) else self.english
+        voice.say(text, stop_event, on_start=on_start)
+
+    def stop(self):
+        self.english.stop()
+        self.arabic.stop()
+
+    def shutdown(self):
+        self.english.shutdown()
+        self.arabic.shutdown()

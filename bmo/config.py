@@ -69,6 +69,9 @@ _DEFAULTS = {
     "semantic_recall_threshold": 0.35,
     "vision_model":              "qwen/qwen3.8-27b",
     "no_speech_timeout":         3.5,
+    "fish_audio_api_key":        "",
+    "fish_audio_voice":          "33c6142c55624bd2a60957e7cef89286",  # "بيمو" on fish.audio
+    "fish_audio_model":          "s2.1-pro",
     "life_enabled":              True,
     "life_quiet_start":          "23:00",
     "life_quiet_end":            "08:00",

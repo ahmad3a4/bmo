@@ -181,7 +181,7 @@ class LifeEngine:
         self.look      = look         # look() -> None | {"face": bool, "name": str | None}
         self.set_face  = set_face
         self.enabled   = (cfg.get("life_enabled", True)
-                          and cfg.get("language", "english").lower() == "english")
+                          and cfg.get("language", "english").lower() in ("english", "auto"))
         self.owner     = cfg.get("voice_id_owner") or cfg.get("user_name") or "your friend"
         self.api_key   = cfg.get("groq_api_key", "")
         self.quiet     = (_minutes(cfg.get("life_quiet_start", "23:00")),

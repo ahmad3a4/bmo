@@ -45,5 +45,6 @@
     "face_brightness_boost": 1.0,
     "semantic_memory_enabled": true,
     "semantic_embed_model": "all-minilm",
-    "semantic_recall_threshold": 0.35
+    "semantic_recall_threshold": 0.35,
+    "fish_audio_api_key": ""
 }

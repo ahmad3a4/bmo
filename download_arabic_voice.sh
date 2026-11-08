@@ -10,8 +10,11 @@ ONNX_OUT="$VOICES_DIR/$MODEL_NAME.onnx"
 echo "🔊 Downloading Arabic (ar_JO-kareem-low) Piper voice model..."
 echo "   Target: $ONNX_OUT"
 
-if [ -f "$ONNX_OUT" ] && [ "$(stat -c%s "$ONNX_OUT" 2>/dev/null)" -gt 1000000 ]; then
-    echo "✅ ONNX model already exists and looks valid."
+# Compare against the server's real size: a "bigger than 1 MB" check once let a
+# download cut off at 8 MB (of ~60 MB) pass as valid, and Piper couldn't load it.
+EXPECTED=$(curl -sIL "$ONNX_URL" | grep -i '^content-length' | tail -1 | tr -dc '0-9')
+if [ -f "$ONNX_OUT" ] && [ -n "$EXPECTED" ] && [ "$(stat -c%s "$ONNX_OUT" 2>/dev/null)" = "$EXPECTED" ]; then
+    echo "✅ ONNX model already exists and is complete."
 else
     echo "⬇️  Downloading ONNX (~60MB)..."
     wget -q --show-progress -O "$ONNX_OUT" "$ONNX_URL"
